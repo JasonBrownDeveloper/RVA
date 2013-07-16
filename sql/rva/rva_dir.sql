@@ -4,4 +4,10 @@ CREATE OR REPLACE DIRECTORY
 RVADIR AS 
 '/home/user/works/rva';
 
+DROP DIRECTORY WORKDIR;
+
+CREATE OR REPLACE DIRECTORY 
+WORKDIR AS 
+'/home/user/works';
+
 exit

@@ -1,0 +1,678 @@
+#!/bin/ksh
+set -x
+
+cd $HOME
+. .profile
+
+LOGDIR=$HOME/reports/rva/rvafiles_`date +%Y%m`
+LOGFILE=$LOGDIR/rva_`date +%Y%m%d%H%M%S`.log
+ONCALLSQL=$HOME/sql/oncall.sql
+ONCALLOUT=$HOME/reports/oncall.spool
+ONCALLEMAIL=`sed '/^$/d' $ONCALLOUT | awk '{print $1}'`
+ONCALLPAGER=`sed '/^$/d' $ONCALLOUT | awk '{print $2}'`
+WORKDIR=$HOME/works/rva/rva_`date +%H%M%S`
+STARTTIME=`date +%Y-%m-%dT%H:%M:%S`
+AP1=127.0.0.1
+AP2=127.0.0.2
+AP3=127.0.0.3
+AP4=127.0.0.4
+
+SCRIPT=$0
+
+function NotifyOncall {
+  ERROR="ERROR $SCRIPT $ERROR"
+  echo $ERROR >> $LOGFILE
+  cat $LOGFILE | mailx -s "$ERROR" $ONCALLEMAIL
+  echo $ERROR | mailx $ONCALLPAGER
+  return
+}
+
+mkdir $LOGDIR
+
+# Pick up on call person
+# Connect to database and run script to query oncall table and spool results.
+sqlplus -s $sqlplus @$ONCALLSQL $ONCALLOUT
+
+if [[ $? -ne 0 ]]
+then
+  ERROR="Could not pick up on-call person."
+  NotifyOncall
+  exit 1
+fi
+ONCALLEMAIL=`sed '/^$/d' $ONCALLOUT | awk '{print $1}'`
+ONCALLPAGER=`sed '/^$/d' $ONCALLOUT | awk '{print $2}'`
+echo "On-call Email: $ONCALLEMAIL" >> $LOGFILE
+echo "On-call Pager: $ONCALLPAGER" >> $LOGFILE
+
+echo "***** STARTING on `date` *****" >> $LOGFILE
+
+# Determine what sites are avaliable
+set -A SITES `cmd sites | grep -e $AP1 -e $AP2 -e $AP3 -e $AP4 | awk '{print $1}'`
+if [[ ${#SITES[*]} -lt 1 ]]
+then
+  ERROR="could not find available app server"
+  NotifyOncall
+  exit 1
+fi
+
+echo $WORKDIR >> $LOGFILE
+mkdir $WORKDIR
+
+# Pull any RVA xml files from app servers
+CURRENT=0
+while [[ $CURRENT -lt ${#SITES[*]} ]]
+do
+  scp ${SITES[$CURRENT]}:$HTMLDIR/RVA_*.xml $WORKDIR
+  ssh ${SITES[$CURRENT]} "rm $HTMLDIR/RVA_*.xml"
+  CURRENT=$((CURRENT + 1))
+done
+
+# Create dynamic sql file
+FILELIST=`ls $WORKDIR/RVA_*.xml`
+echo $FILELIST >> $LOGFILE
+echo 'BEGIN' > $WORKDIR/rva_ondemand.sql
+for FILE in $FILELIST
+do
+  echo "INSERT INTO rva_xml VALUES (XMLType(BFILENAME('WORKDIR', '`basename $FILE`'),NLS_CHARSET_ID('AL32UTF8')), NULL);" >> $WORKDIR/rva_ondemand.sql 
+  # The Oracle directory object can't be dynamic so move it to a static path.  This can be dangerous if two runs overlap
+  mv $FILE $WORKDIR/..
+done
+echo 'COMMIT;' >> $WORKDIR/rva_ondemand.sql
+echo 'END;' >> $WORKDIR/rva_ondemand.sql
+echo '/' >> $WORKDIR/rva_ondemand.sql
+echo 'exit' >> $WORKDIR/rva_ondemand.sql
+
+# Load rva xml files into database
+sqlplus $sqlplus @$WORKDIR/rva_ondemand.sql
+
+for FILE in $FILELIST
+do
+  #TESTING rm $WORKDIR/../`basename $FILE`
+  touch $WORKDIR/../`basename $FILE`
+done
+
+# Use PL/SQL and XPath to form rva requests
+sqlplus -s $sqlplus << EOF
+  set serveroutput on size 100000
+
+  --Get static date time
+  COL datetime NEW_VALUE datetime
+  SELECT TO_CHAR(SYSDATE,'DD-MON-YYYY HH24:MI:SS') AS datetime FROM DUAL;
+
+  --Process RVA ondemand
+  DECLARE
+    eventidx INTEGER;
+    meterno VARCHAR2(20);
+    meterid NUMBER;
+    psr NUMBER;
+    am_system CHAR(1);
+    restoretime DATE;
+    begintime DATE;
+    i INTEGER;
+    request CHAR(166);
+  
+    CURSOR xml_table IS
+      SELECT *
+        FROM rva_xml
+       WHERE processed = TO_DATE('&datetime','DD-MON-YYYY HH24:MI:SS');
+    
+  BEGIN
+    UPDATE rva_xml
+       SET processed = TO_DATE('&datetime','DD-MON-YYYY HH24:MI:SS')
+     WHERE processed IS NULL;
+       
+    FOR xml_rec IN xml_table
+    LOOP
+      IF xml_rec.xml.existsNode('/WIDGET_PRINT/WIDGET/CHILDREN/WIDGET[NAME=''tiCustInfoForm'']/CHILDREN/WIDGET[NAME=''tiCustRefNumText'']/VALUE') = 0 THEN
+        DBMS_OUTPUT.PUT_LINE('Error: Couldn''t find event_idx');
+      ELSE  
+        --extractValue is not supported in PL/SQL yet, have to use extract() + getNumberVal()
+        eventidx := xml_rec.xml.extract('/WIDGET_PRINT/WIDGET/CHILDREN/WIDGET[NAME=''tiCustInfoForm'']/CHILDREN/WIDGET[NAME=''tiCustRefNumText'']/VALUE/text()').getNumberVal();
+    
+        i := 1;
+        LOOP
+          EXIT WHEN xml_rec.xml.existsNode('/WIDGET_PRINT/WIDGET/CHILDREN/WIDGET[''tiCust_xrttable'']/CELL_VALUES/ROW['||i||']') = 0;
+    
+	  DECLARE
+	    no_meter_no EXCEPTION;
+	    no_event_idx EXCEPTION;
+          BEGIN
+            meterno := xml_rec.xml.extract('/WIDGET_PRINT/WIDGET/CHILDREN/WIDGET[''tiCust_xrttable'']/CELL_VALUES/ROW['||i||']/CELL[14]/VALUE/text()').getStringVal();
+  
+	    BEGIN
+              SELECT meter_id, meter_user_def_4, meter_user_def_5
+                INTO meterid, psr, am_system
+                FROM cu_meters
+               WHERE meter_no = meterno;
+            EXCEPTION
+              WHEN no_data_found THEN
+		RAISE no_meter_no; --Dont create a request; exit from outer block
+            END;
+  
+	    IF psr >= 85 OR am_system = 'G' THEN
+  	      BEGIN
+                SELECT NVL(restore_time,SYSDATE), NVL(begin_time,SYSDATE)
+                  INTO restoretime, begintime
+                  FROM jobs
+                 WHERE event_idx = eventidx;
+              EXCEPTION
+                WHEN no_data_found THEN
+  		RAISE no_event_idx; --Dont create a request; exit from outer block
+              END;
+
+              request := substr(rpad(eventidx,25,' '),1,25)
+                      || 'IND'
+                      || 'M'
+                      || substr(rpad(meterno,20,' '),1,20)
+                      || substr(rpad(meterid,25,' '),1,25)
+                      || substr(rpad('R'||am_system,25,' '),1,25) --util_extra_1
+                      || substr(rpad(to_char(begintime,'MM/DD/YY HH24:MI:SS'),25,' '),1,25) --util_extra_2
+                      || substr(rpad(' ',25,' '),1,25) --util_extra_3
+                      || to_char(NVL(restoretime,SYSDATE),'MM/DD/YY HH24:MI:SS');
+
+              INSERT INTO rva_cnet VALUES (eventidx, meterid, request, NULL, NULL, NULL);
+            END IF;
+          EXCEPTION
+	    WHEN no_meter_no THEN
+              DBMS_OUTPUT.PUT_LINE('No rows returned for meterno: '||eventidx||' '||meterno);
+            WHEN no_event_idx THEN
+              DBMS_OUTPUT.PUT_LINE('No rows returned for eventidx: '||eventidx||' '||meterno);
+            WHEN others THEN
+              DBMS_OUTPUT.PUT_LINE('Others ' || SQLCODE || ' ' || SQLERRM ||': '||eventidx||' '||meterno);
+	  END;
+    
+          i := i + 1;
+        END LOOP;
+      END IF;
+    END LOOP;
+  END;
+  /
+
+  --Process RVA automated
+  BEGIN
+    INSERT INTO rva_cnet
+      SELECT DISTINCT
+ 	       j.event_idx
+           , i.account_num
+           ,    substr(rpad(j.event_idx,25,' '),1,25)
+             || 'IND'
+             || 'M'
+             || substr(rpad(cm.meter_no,20,' '),1,20)
+             || substr(rpad(i.account_num,25,' '),1,25)
+             || substr(rpad('S'||cm.meter_user_def_5,25,' '),1,25) --util_extra_1
+             || substr(rpad(NVL(substr(i.alternate_phone,4,7)||substr(i.alternate_phone,1,3),' '),25,' '),1,25) --util_extra_2
+             || substr(rpad(NVL(i.language_flag,' ')||i.complaint,25,' '),1,25) --util_extra_3
+             || to_char(NVL(j.begin_time,SYSDATE),'MM/DD/YY HH24:MI:SS')
+           , NULL
+           , NULL
+           , NULL
+        FROM jobs j
+           , (select event_idx
+                   , user_name
+                   , complaint
+                   , account_num
+                   , alternate_phone
+                   , language_flag
+                from incidents i2
+               where numb = (select max(numb)
+                               from incidents
+                              where i2.event_idx = event_idx
+                                and i2.account_num = account_num)) i
+           , cu_meters cm
+           , rva_cnet rc
+       WHERE j.event_idx = i.event_idx
+         AND i.account_num = cm.meter_id
+         AND j.event_idx = rc.event_idx(+)
+ 	   AND (rc.transmitted is NULL -- Haven't already sent a request for this event
+ 	    OR rc.transmitted <= SYSDATE - 6/24) -- Or enough time has elapsed 
+         AND j.alarm_state in ('NEW','UAS','ASN') -- Not already being worked
+         AND j.num_cust_out = 1 -- Singles only
+         AND i.user_name <> 'CNET' -- Not entered by the POA process
+         AND NOT REGEXP_LIKE(i.user_name, '[0-9]{4}') -- Not entered by a CSR
+         AND i.complaint LIKE '1%' -- Outs only
+         AND (cm.meter_user_def_4 >= 85 OR cm.meter_user_def_5 = 'G'); -- Only reliable meters
+  END;
+  /
+
+  --Spool CellNet request file
+  UPDATE rva_cnet
+     SET transmitted = TO_DATE('&datetime','DD-MON-YYYY HH24:MI:SS')
+   WHERE transmitted IS NULL;
+
+  spool $WORKDIR/rva_cnet.1
+  set head off linesize 166 pagesize 0 feedback off
+  SELECT message_tx
+    FROM rva_cnet
+   WHERE transmitted = TO_DATE('&datetime','DD-MON-YYYY HH24:MI:SS');
+  spool off
+
+  exit
+EOF
+
+sed -e '/^new/d' -e '/^old/d' $WORKDIR/rva_cnet.1 > $WORKDIR/rva_cnet.2
+cat $WORKDIR/rva_cnet.2 >> $LOGFILE
+if [[ `wc $WORKDIR/rva_cnet.2 | awk '{print $1}'` -gt 0 ]]
+then
+  set -A METERS `cat $WORKDIR/rva_cnet.2 | perl -w -e '
+    use SOAP::Lite
+      +trace => "debug";
+
+    my %outaged_hash = ();
+
+    # <> is stdin
+    while (<>) {
+      my $orderNumber = substr($_, 0, 25);
+
+      my $deviceId = substr($_, 29, 20);
+      my $deviceIdTrim = $deviceId;
+      $deviceIdTrim =~ s/^\s+//;
+      $deviceIdTrim =~ s/\s+$//;
+
+      my $deviceType = substr($_, 28, 1);
+      my $restoreTime = substr($_, 149, 17);
+
+      my $requestType = substr($_, 25, 3);
+      my $utilityId = substr($_, 49, 25);
+      my $utilExtra1 = substr($_, 74, 25);
+      my $utilExtra2 = substr($_, 99, 25);
+      my $utilExtra3 = substr($_, 124, 25);
+
+      my $SR = substr($utilExtra1,0,1);
+      my $am_system = substr($utilExtra1,1,1);
+
+      if ($am_system eq "G") {
+        # Initialize Outaged hash only once
+	if (!%outaged_hash) {
+          my $results = SOAP::Lite
+            -> uri("http://www.multispeak.org/Version_3.0")
+            -> proxy("https://127.0.0.5/cc/webapi/OD_OA.asmx")
+            -> xmlschema("http://www.w3.org/2001/XMLSchema")
+            -> on_action(sub{join "/", @_})
+            -> GetOutagedODDevices();
+  
+          if ($results->fault) {
+#           print join ", ", $results->faultcode, $results->faultstring;
+          } else {
+            for my $hash_ref ($results->valueof("//GetOutagedODDevicesResponse/GetOutagedODDevicesResult/outageDetectionDevice")) {
+	      $outaged_hash{$hash_ref->{meterNo}} = 1;
+            }
+	  }
+	}
+
+        my $processTime = $restoreTime;
+        my $lastPacketTime = $restoreTime;
+        my $lastGaspTime = $restoreTime;
+        my $errorMessage = " " x 30;
+
+        if ($outaged_hash{$deviceIdTrim}) {
+          print $orderNumber                   # 01:25
+              . $requestType                   # 26:28
+              . "M"                            # 29:29
+              . $deviceId                      # 30:49
+              . $deviceId                      # 50:69
+              . $utilityId                     # 70:94
+              . $restoreTime                   # 95:111
+              . $utilExtra1                    #112:136
+              . $utilExtra2                    #137:161
+              . $utilExtra3                    #162:186
+              . $processTime                   #187:203
+              . $lastPacketTime                #204:220
+              . $lastGaspTime                  #221:237
+              . "OU"                           #238:239
+              . $errorMessage                  #240:269
+              . " "                            #270:270
+              . "\n";
+	} else {
+          print $orderNumber                   # 01:25
+              . $requestType                   # 26:28
+              . "M"                            # 29:29
+              . $deviceId                      # 30:49
+              . $deviceId                      # 50:69
+              . $utilityId                     # 70:94
+              . $restoreTime                   # 95:111
+              . $utilExtra1                    #112:136
+              . $utilExtra2                    #137:161
+              . $utilExtra3                    #162:186
+              . $processTime                   #187:203
+              . $lastPacketTime                #204:220
+              . $lastGaspTime                  #221:237
+              . "ON"                           #238:239
+              . $errorMessage                  #240:269
+              . " "                            #270:270
+              . "\n";
+	}
+      } else {
+	my $orderNumberTrim = $orderNumber;
+        $orderNumberTrim =~ s/^\s+//;
+        $orderNumberTrim =~ s/\s+$//;
+
+        # This will work for the next 90 years then it will need to be updated y21xx bug
+        my $restoreTimeSOAP = $restoreTime;
+        $restoreTimeSOAP =~ /([0-9]{2})\/([0-9]{2})\/([0-9]{2}) ([0-9]{2}):([0-9]{2}):([0-9]{2})/;
+        $restoreTimeSOAP = "20$3-$1-$2T$4:$5:$6"; 
+
+        my $results = SOAP::Lite
+          -> uri("http://cope.cellnet.com")
+          -> proxy("https://127.0.0.6:8443/cope/services/rva")
+          -> xmlschema("http://www.w3.org/2001/XMLSchema")
+          -> verifyDevice(SOAP::Data->name("orderNumber" => "$orderNumberTrim")
+                        , SOAP::Data->name("deviceId" => "$deviceIdTrim")->type("xsd:string")
+                        , SOAP::Data->name("deviceType" => "$deviceType")
+                        , SOAP::Data->name("restoreTime" => "$restoreTimeSOAP")->type("xsd:dateTime"));
+
+        if ($results->fault) {
+#          print join ", ", $results->faultcode, $results->faultstring;
+        } else {
+          for $hash_ref ($results->valueof("//verifyDeviceResponse/restorationResponse")) {
+            my $restoreTime = $hash_ref->{lastPacketTime};
+            $restoreTime =~ /[0-9]{2}([0-9]{2})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2}).*/;
+            $restoreTime = "$2/$3/$1 $4:$5:$6"; 
+
+            my $processTime = $hash_ref->{processTime};
+            $processTime =~ /[0-9]{2}([0-9]{2})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2}).*/;
+            $processTime = "$2/$3/$1 $4:$5:$6"; 
+
+            my $lastPacketTime = $restoreTime;
+
+            my $lastGaspTime = "";
+	    $lastGaspTime = $hash_ref->{lastGaspTime};
+            $lastGaspTime =~ /[0-9]{2}([0-9]{2})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2}).*/;
+            $lastGaspTime = "$2/$3/$1 $4:$5:$6"; 
+
+	    my $errorMessage = " " x 30;
+	    if (defined $hash_ref->{errMsg}) {
+	      $errorMessage = sprintf("%*s", 30, $hash_ref->{errMsg});
+	    }
+
+            print $orderNumber                   # 01:25
+                . $requestType                   # 26:28
+                . $hash_ref->{deviceType}        # 29:29
+                . $deviceId                      # 30:49
+                . $deviceId                      # 50:69
+                . $utilityId                     # 70:94
+                . $restoreTime                   # 95:111
+                . $utilExtra1                    #112:136
+                . $utilExtra2                    #137:161
+                . $utilExtra3                    #162:186
+                . $processTime                   #187:203
+                . $lastPacketTime                #204:220
+                . $lastGaspTime                  #221:237
+                . $hash_ref->{devicePowerStatus} #238:239
+                . $errorMessage                  #240:269
+                . $hash_ref->{updateFlag}        #270:270
+                . "\n";
+          }
+        }
+      }
+    }
+  ' > $WORKDIR/rva_cnet.3`
+fi
+
+date +%Y%m%d%H%M%S > $WORKDIR/../last.request
+
+FINDIR=$HOME/fin/rva/rvafiles_`date +%Y%m`
+SQLDIR=$HOME/sql/rva
+SQLLOG=${LOGFILE##*/}
+SQLLOG=${SQLLOG%%.log}
+
+echo "Checking file size" >> $LOGFILE
+LINECOUNT=`wc $WORKDIR/rva_cnet.3 | awk '{print $1}'`
+
+if [[ $LINECOUNT -eq 0 ]]
+then
+  echo "RVA file is empty - nothing to load" >> $LOGFILE
+  exit 0
+fi
+echo "RVA file contains data" >> $LOGFILE
+
+echo "Loading RVA file into DB at `date +%H:%M:%S`" >> $LOGFILE
+mkdir $FINDIR
+
+# sqlldr return codes for unix
+EX_SUCC=0
+EX_FAIL=1
+EX_WARN=2
+EX_FTL=3
+
+sqlldr userid=$sqlplus \
+      control=$SQLDIR/rva.ctl \
+          log=$FINDIR/$SQLLOG.log \
+          bad=$FINDIR/$SQLLOG.bad \
+         data=$WORKDIR/rva_cnet.3
+STAT=$?
+
+# If error, log to file, email, page, and exit
+if [[ $STAT -eq $EX_FAIL || $STAT -eq $EX_FTL ]]
+then
+  ERROR="ABORTED at SQLLDR"
+  NotifyOncall
+  exit 1
+elif [[ $STAT -eq $EX_WARN ]]
+then
+  STATUS="with warnings"
+else
+  STATUS="with no warnings"
+fi
+
+echo "Done loading RVA file $STATUS at `date +%H:%M:%S`" >> $LOGFILE
+ROWSLOADED=`grep "successfully loaded" $FINDIR/$SQLLOG.log`
+echo "$ROWSLOADED" >> $LOGFILE
+
+if [[ -f $FINDIR/$SQLLOG.bad ]]
+then
+  ERROR="Bad records in rva file"
+  NotifyOncall
+  echo "Bad records skipped - continuing..." >> $LOGFILE
+fi
+
+sqlplus -s $sqlplus << EOF >> $LOGFILE
+  set serveroutput on size 100000
+
+  --Get static date time
+  COL datetime NEW_VALUE datetime
+  SELECT TO_CHAR(SYSDATE,'DD-MON-YYYY HH24:MI:SS') AS datetime FROM DUAL;
+
+  --Process RVA responses
+  DECLARE
+    CURSOR rva_table IS
+      SELECT *
+        FROM rva_work
+       WHERE processed = TO_DATE('&datetime','DD-MON-YYYY HH24:MI:SS');
+
+    cust_rec ces_customers%ROWTYPE;
+  BEGIN
+    UPDATE rva_cnet rc
+       SET (message_rx, received) = (
+      SELECT message_rx, received
+        FROM rva_work rw
+       WHERE rc.event_idx = rw.event_idx
+         AND rc.meter_id = rw.meter_id)
+     WHERE EXISTS (
+      SELECT message_rx, received
+        FROM rva_work rw
+       WHERE rc.event_idx = rw.event_idx
+         AND rc.meter_id = rw.meter_id)
+       AND rc.transmitted = (SELECT MAX(transmitted)
+                               FROM rva_cnet
+                              WHERE event_idx = rc.event_idx
+                                AND meter_id = rc.meter_id);
+
+    UPDATE rva_work
+       SET processed = TO_DATE('&datetime','DD-MON-YYYY HH24:MI:SS')
+     WHERE processed IS NULL;
+
+    FOR rva_rec IN rva_table
+    LOOP
+      IF substr(rva_rec.util_extra_1,1,1) = 'R' THEN
+        IF rva_rec.device_power_status = 'OU' OR rva_rec.device_power_status = 'RO' THEN
+          BEGIN
+            SELECT *
+              INTO cust_rec
+              FROM ces_customers
+             WHERE meter_id = rva_rec.meter_id;
+
+            INSERT INTO ces_calls ( account_number
+                                  , phone_number
+                                  , phone_area
+		                  , comments
+                                  , city_state
+                                  , address
+                                  , account_name
+                                  , device_cls
+                                  , device_idx
+                                  , trouble_code
+                                  , date_time
+                                  , ces_status
+                                  , trs_status
+                                  , empl_no
+                                  , meter_number
+                                  , meter_location
+                                  , process_time)
+                           VALUES ( lpad(rva_rec.meter_id,13,'0')
+                                  , cust_rec.phone_number
+                                  , cust_rec.phone_area
+		                  , 'CNET Ping'
+                                  , cust_rec.city_state
+                                  , cust_rec.address
+                                  , cust_rec.account_name
+                                  , 994
+                                  , cust_rec.supply_idx
+                                  , '1005'
+                                  , to_date(rva_rec.util_extra_2,'MM/DD/YY HH24:MI:SS')
+                                  , 'NEW'
+                                  , 'NEW'
+                                  , 'RVA'
+                                  , cust_rec.meter_number
+                                  , cust_rec.meter_location
+                                  , SYSDATE);
+          EXCEPTION
+            WHEN no_data_found THEN
+              DBMS_OUTPUT.PUT_LINE('No customer found for service point: '||rva_rec.meter_id);
+            WHEN too_many_rows THEN
+              DBMS_OUTPUT.PUT_LINE('More than one customer found for service point: '||rva_rec.meter_id);
+            WHEN others THEN
+              DBMS_OUTPUT.PUT_LINE('others: '||sqlcode||' '||sqlerrm);
+          END;
+        END IF;
+      ELSIF substr(rva_rec.util_extra_1,1,1) = 'S' THEN
+        IF rva_rec.device_power_status = 'ON' THEN
+          BEGIN
+            SELECT *
+              INTO cust_rec
+              FROM ces_customers
+             WHERE meter_id = rva_rec.meter_id;
+
+            INSERT INTO ces_calls ( account_number
+                                  , phone_number
+                                  , phone_area
+                                  , city_state
+                                  , address
+                                  , account_name
+                                  , device_cls
+                                  , device_idx
+                                  , trouble_code
+                                  , date_time
+                                  , ces_status
+                                  , trs_status
+                                  , empl_no
+                                  , meter_number
+                                  , meter_location
+                                  , process_time)
+                           VALUES ( lpad(rva_rec.meter_id,13,'0')
+                                  , cust_rec.phone_number
+                                  , cust_rec.phone_area
+                                  , cust_rec.city_state
+                                  , cust_rec.address
+                                  , cust_rec.account_name
+                                  , 994
+                                  , cust_rec.supply_idx
+                                  , '1003'
+                                  , rva_rec.last_packet_time
+                                  , 'NEW'
+                                  , 'NEW'
+                                  , 'RVA'
+                                  , cust_rec.meter_number
+                                  , cust_rec.meter_location
+                                  , SYSDATE);
+
+            INSERT INTO rva_tfcc ( event_idx
+                                 , meter_id
+                                 , message_tx
+                                 , transmitted)
+                          VALUES ( rva_rec.event_idx
+                                 , rva_rec.meter_id
+                                 ,    to_char(to_date('&datetime','DD-MON-YYYY HH24:MI:SS'),'YYYYMMDDHH24MISS')
+                                   || '3'
+                                   || substr(rpad(cust_rec.meter_location,2,' '),1,2)
+                                   || substr(rpad(cust_rec.meter_number,13,' '),1,13)
+                                   || substr(rpad(cust_rec.account_name,20,' '),1,20)
+		                   || substr(lpad(nvl(substr(rva_rec.util_extra_2,4,7),nvl(cust_rec.phone_number,'0')),7,'0'),1,7)
+		                   || substr(lpad(nvl(substr(rva_rec.util_extra_2,1,3),nvl(cust_rec.phone_area,'0')),3,'0'),1,3)
+                                   || substr(rpad(cust_rec.address,50,' '),1,50)
+                                   || substr(rpad(trim(replace(substr(cust_rec.city_state,1,length(cust_rec.city_state)-3),',',' ')),10,' '),1,10)
+                                   || substr(rpad(substr(cust_rec.city_state,-2,2),2,' '),1,2)
+                                   || '        '
+                                   || substr(rpad(cust_rec.supply_idx,10,' '),1,10)
+                                   || substr(lpad(rva_rec.meter_id,10,'0'),1,10)
+                                   || substr(rpad(nvl(cust_rec.priority,' '),2,' '),1,2)
+                                   || '              '
+                                   || '          '
+                                   || '00'
+                                   || substr(rva_rec.util_extra_3,2,4)
+                                   || decode(substr(rva_rec.util_extra_3,1,1),'S','S','H','S','E')
+                                   || substr(lpad(cust_rec.meter_id,13,' '),4,10)
+                                 , NULL);
+          EXCEPTION
+            WHEN no_data_found THEN
+              DBMS_OUTPUT.PUT_LINE('No customer found for service point: '||rva_rec.meter_id);
+            WHEN too_many_rows THEN
+              DBMS_OUTPUT.PUT_LINE('More than one customer found for service point: '||rva_rec.meter_id);
+            WHEN others THEN
+              DBMS_OUTPUT.PUT_LINE('others: '||sqlcode||' '||sqlerrm);
+          END;
+        END IF;
+      ELSE
+        DBMS_OUTPUT.PUT_LINE('Unknown Request type: '||rva_rec.message_rx);
+      END IF;
+    END LOOP;
+
+    --TESTING DELETE FROM rva_work
+     --WHERE processed = TO_DATE('&datetime','DD-MON-YYYY HH24:MI:SS');
+  END;
+  /
+
+  --Spool TFCC request file
+  UPDATE rva_tfcc
+     SET transmitted = TO_DATE('&datetime','DD-MON-YYYY HH24:MI:SS')
+   WHERE transmitted IS NULL;
+
+  spool $WORKDIR/rva_tfcc.1
+  set head off linesize 193 pagesize 0 feedback off
+  SELECT message_tx
+    FROM rva_tfcc
+   WHERE transmitted = TO_DATE('&datetime','DD-MON-YYYY HH24:MI:SS');
+  spool off
+
+  exit
+EOF
+
+sed -e '/^new/d' -e '/^old/d' -e '/^$/d' $WORKDIR/rva_tfcc.1 > $WORKDIR/rva_tfcc.2
+if [[ `wc $WORKDIR/rva_tfcc.2 | awk '{print $1}'` -gt 0 ]]
+then
+  ERROR=`cat $WORKDIR/rva_tfcc.2 | cnetput CALLBACKS.TO.IT`
+  echo $ERROR | grep "reason code"
+  if [[ $? -ne 1 ]]
+  then
+    echo $ERROR >> $LOGFILE
+    ERROR="ABORTED at mqput"
+    NotifyOncall
+    exit 1
+  fi
+fi
+
+#TESTING rm -rf $WORKDIR
+
+echo "***** FINISHED on `date` *****" >> $LOGFILE
+
+exit 0
+
