@@ -110,7 +110,7 @@ else
     echo "Loading ${RVAARRAY[$ITER]}..." >> $LOGFILE
 
     echo "Checking date" >> $LOGFILE
-    RVADATE='`echo ${RVAARRAY[$ITER]} | awk -F. '{print $3}'`00'
+    RVADATE="`echo ${RVAARRAY[$ITER]} | awk -F. '{print \$3}'`00"
     DIFF=`difftime $RVADATE $CURRDATE`
 
     # more than 1 day?
@@ -119,6 +119,7 @@ else
       ERROR="Invalid date - rejecting RVA file"
       NotifyOncall
       echo "RVA file not loaded - continuing..." >> $LOGFILE
+      let "ITER = ITER + 1"
       continue
     fi
     echo "Date okay." >> $LOGFILE
@@ -129,6 +130,7 @@ else
     if [[ $LINECOUNT -eq 0 ]]
     then
       echo "RVA file is empty - nothing to load" >> $LOGFILE
+      let "ITER = ITER + 1"
       continue
     fi
     echo "RVA file contains data" >> $LOGFILE
