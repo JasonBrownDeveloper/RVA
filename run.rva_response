@@ -178,7 +178,7 @@ else
   done
 
   sqlplus -s $sqlplus << EOF >> $LOGFILE
-    set serveroutput on 100000
+    set serveroutput on size 100000
 
     --Get static date time
     COL datetime NEW_VALUE datetime
@@ -360,7 +360,6 @@ else
 EOF
 
   sed -e '/^new/d' -e '/^old/d' -e '/^$/d' $WORKDIR/rva_tfcc.1 > $WORKDIR/rva_tfcc.2
-  cat $WORKDIR/rva_tfcc.2 >> $LOGFILE
   if [[ `wc $WORKDIR/rva_tfcc.2 | awk '{print $1}'` -gt 0 ]]
   then
     ERROR=`cat $WORKS/rva_tfcc.2 | /opt/mqm/samp/bin/amqsputc CALLBACKS.TO.IT`

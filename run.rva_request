@@ -121,7 +121,7 @@ fi
 
 # Use PL/SQL and XPath to form rva requests
 sqlplus -s $sqlplus << EOF
-  set serveroutput on 100000
+  set serveroutput on size 100000
 
   --Get static date time
   COL datetime NEW_VALUE datetime
