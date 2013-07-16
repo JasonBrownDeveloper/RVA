@@ -141,11 +141,11 @@ sqlplus -s $sqlplus << EOF
     CURSOR xml_table IS
       SELECT *
         FROM rva_xml
-       WHERE processed = '&datetime';
+       WHERE processed = to_date('&datetime', 'DD-MON-YYYY HH24:MI:SS');
     
   BEGIN
     UPDATE rva_xml
-       SET processed = '&datetime'
+       SET processed = to_date('&datetime', 'DD-MON-YYYY HH24:MI:SS')
      WHERE processed IS NULL;
        
     FOR xml_rec IN xml_table
@@ -272,7 +272,7 @@ sqlplus -s $sqlplus << EOF
 
   --Spool CellNet request file no more than 2k
   UPDATE rva_cnet
-     SET transmitted = '&datetime'
+     SET transmitted = to_date('&datetime', 'DD-MON-YYYY HH24:MI:SS')
    WHERE transmitted IS NULL
      AND ROWNUM <= 2000;
 
@@ -280,7 +280,7 @@ sqlplus -s $sqlplus << EOF
   set head off linesize 166 pagesize 0 feedback off
   SELECT message_tx
     FROM rva_cnet
-   WHERE transmitted = '&datetime';
+   WHERE transmitted = to_date('&datetime', 'DD-MON-YYYY HH24:MI:SS');
   spool off
 
   exit
