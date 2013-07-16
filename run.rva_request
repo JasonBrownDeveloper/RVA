@@ -164,7 +164,7 @@ sqlplus -s $sqlplus << EOF
 	    no_meter_no EXCEPTION;
 	    no_event_idx EXCEPTION;
           BEGIN
-            meterno := xml_rec.xml.extract('/WIDGET_PRINT/WIDGET/CHILDREN/WIDGET[''tiCust_xrttable'']/CELL_VALUES/ROW['||i||']/CELL[13]/VALUE/text()').getStringVal();
+            meterno := xml_rec.xml.extract('/WIDGET_PRINT/WIDGET/CHILDREN/WIDGET[''tiCust_xrttable'']/CELL_VALUES/ROW['||i||']/CELL[14]/VALUE/text()').getStringVal();
   
 	    BEGIN
               SELECT meter_id, meter_user_def_4
