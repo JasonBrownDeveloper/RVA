@@ -125,7 +125,7 @@ sqlplus -s $sqlplus << EOF
 
   --Get static date time
   COL datetime NEW_VALUE datetime
-  SELECT SYSDATE AS datetime FROM DUAL;
+  SELECT TO_CHAR(SYSDATE,'DD-MON-YYYY HH24:MI:SS') AS datetime FROM DUAL;
 
   --Process RVA ondemand
   DECLARE
