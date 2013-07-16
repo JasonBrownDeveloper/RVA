@@ -1,0 +1,288 @@
+#!/usr/bin/ksh
+set -x
+
+cd $HOME 
+. .profile
+
+# server runing this script
+THIS_SERVER=`hostname -s`
+
+# status of oracle cluster application
+CA=oracle
+#CA_STATUS=`caa_stat -t $CA |grep oracle |awk '{print $4}'`
+CA_STATUS="ONLINE"
+
+# check if the script is already running, if so, exit
+scriptcheck=`ps -ef |grep $0 |grep -v "sh -c" |grep -v "grep" |wc -l`
+if [ $scriptcheck -gt 1 ]
+then
+  echo "[`date +%m%d%Y` `date +%T`] $THIS_SERVER:  ERROR: $0 already running, exit."
+  exit 1
+fi
+
+# define variables for files and date on local host
+index_id=`date +%Y%m%d%H%M%S`
+user_password=$RDBMS_USER/$RDBMS_PASSWD
+sqlqual=$HOME/sql
+finqual=$HOME/fin
+outqual=$HOME/reports
+console=$HOME
+neutraldir=/u06/neutralfile/archived_rva_rt
+archdir="$neutraldir/rva_rtfiles_`date +%Y%m`"
+
+# define remote directories, RVA file archives, server and database variables
+username=s
+dbname=$RDBMS_HOST
+
+remote_svr_dir=/neutralfile
+remote_cnet_dir=/neutralfile/cnet_rvback
+remote_tmp_dir=$remote_cnet_dir/rva_rt_response$index_id
+remote_arch_dir="$remote_svr_dir/archived_rva_rt/rva_rtfiles_`date +%Y%m`"
+
+# clean up fin file from previous rva process run
+rm -f $finqual/rva_rt_cnetfin.*
+
+# clean up last fin files
+rm -f $finqual/restore*
+
+# define cnet log file variables
+cnet_rva_rt_log=$finqual/rva_rt_cnetfin$index_id
+cnet_rva_rt_log2=$finqual/rva_rt_cnetfin2$index_id
+
+echo >> $cnet_rva_rt_log
+
+# validate mode and host arguments required for host and recovery
+# usage run.rva_rt_response [a|s] [host]
+if [ $# -ne 2 ]
+then
+  echo "ERROR $0 called with wrong number of arguments" >> $cnet_rva_rt_log
+  echo "Usage: run.rva_rt_response [a|s] [host]" >> $cnet_rva_rt_log
+exit 1
+fi
+
+# validate mode as an acceptable value
+# a = active
+# s = standby
+if [[ $1 != a ]] && [[ $1 != s ]]
+then
+  echo "INCORRECT value for MODE argument" >> $cnet_rva_rt_log
+  echo "Usage: run.rva_rt_response [a|s] [host]" >> $cnet_rva_rt_log
+  exit 1
+fi
+
+# Mode parameter value for later evaluation
+MODE=$1
+remote_svr=$2
+
+# define email and pager variables
+sender_addr=user@domain.com
+pager_addr2=pager2@domain.com
+email_addr2=user2@domain.com
+stat=0
+
+# clean up email and pager files
+rm -f $outqual/rva_rt_email.prt
+rm -f $outqual/rva_rt_email2.prt
+
+# testing pager and email errors by forcing status to one
+#stat=1
+
+# check if oracle not online when mode is active, if so, send pager and exit here
+if  [[ "$MODE" = "a" ]] && [[ "$CA_STATUS" != "ONLINE" ]]
+then
+  echo "************" > $cnet_rva_rt_log
+  echo "** ORACLE OFF-LINE  **" `date` > $cnet_rva_rt_log
+  echo "** when processing cnet_outage_oncall.sql **" `date` > $cnet_rva_rt_log2
+  echo "************" >> $cnet_rva_rt_log
+  cat $cnet_rva_rt_log | /usr/bin/mailx -s "ORACLE off line " $email_addr2
+  cat $cnet_rva_rt_log2 | /usr/bin/mailx -s "ORACLE off line " $pager_addr2
+  sleep 60
+  echo "EMAIL file sent" >> $cnet_rva_rt_log
+  echo "Pager sent" >> $cnet_rva_rt_log
+  echo "Finished" >> $cnet_rva_rt_log
+  exit 1
+fi
+
+# select from oracle table oncall person
+sqlplus -s $user_password@$dbname @$sqlqual/oncall.sql
+
+# evaluate sqlscript status for oncall person
+if [ $stat != 0 ]
+then
+  echo "**** evaluate status value: $stat ********"
+  echo "************" > $cnet_rva_rt_log
+  echo "** ERR-ORACLE SCRIPT ABORTED  **" `date` > $cnet_rva_rt_log
+  echo "while picking up oncall person" >> $cnet_rva_rt_log
+  echo "** ERR-ORACLE ABORTED  on cnet_outage_oncall.sql **" `date` > $cnet_rva_rt_log2
+  echo "************" >> $cnet_log
+  cat $cnet_rva_rt_log | /usr/bin/mailx -s "ORA not running calls" $email_addr2
+  cat $cnet_rva_rt_log2 | /usr/bin/mailx -s "ORA not running calls" $pager_addr2
+  sleep 60
+  echo "EMAIL file sent" >> $cnet_rva_rt_log
+  echo "Pager sent" >> $cnet_rva_rt_log
+  echo "Finished" >> $cnet_rva_rt_log
+#  exit when testing email and pager functionality
+#  exit  1
+else
+  # output to log, get pager and email
+  echo "* On Call file processed" > $cnet_rva_rt_log
+  email_addr=`sed '/^$/d' $ONCALLOUT | awk '{print $1}'`
+  pager_number=`sed '/^$/d' $ONCALLOUT | awk '{print $2}'`
+  echo "* Oncall email: $email_addr" >> $cnet_rva_rt_log
+  echo "* Oncall pager: $pager_number" >> $cnet_rva_rt_log
+fi
+
+# check for files on remote host
+echo "********** Start RVA file process on `date` **********"  >> $cnet_rva_rt_log
+#FILESTATUS=`ssh -xl $username $remote_svr ls -1 $remote_cnet_dir/restore* |wc -l`
+
+#if [ $FILESTATUS -eq 0 ]
+#  then
+#  echo " No calls received " `date` >> $cnet_rva_rt_log
+#  echo "***** Finished on  `date`" >> $cnet_rva_rt_log
+#  exit 0
+# else
+#  echo " Found $FILESTATUS calls file(s)"  >> $cnet_rva_rt_log
+# fi
+
+#  RVA archive make directory 
+mkdir -p -m 777 $archdir
+
+echo "archived directory  $archdir " >> $cnet_rva_rt_log
+
+echo "RVA file transfer from PDM to host - process begins " >> $cnet_rva_rt_log
+
+# create host directory to move files from remote
+#wkqual=$HOME/works/rva_rt_outage$index_id
+#mkdir -p -m 777 $wkqual
+wkqual=$HOME/works/rva_outage
+
+# make directory on PDM,  move and copy files to temporary directory
+ssh -xl $username $remote_svr mkdir -p -m 777 $remote_tmp_dir
+echo " $remote_tmp_dir temp directory created" >> $cnet_rva_rt_log
+echo "Result of mkdir temp command: " $? >> $cnet_rva_rt_log
+
+ssh -xl $username $remote_svr mv $remote_cnet_dir/restore* $remote_tmp_dir
+
+# grab files from temp PDM directory to host directory
+scp $username@$remote_svr:$remote_tmp_dir/restore* $wkqual
+
+# archive filed on host directory
+cp $wkqual/restore* $archdir
+
+echo "Response RVA files transfered to host" >> $cnet_rva_rt_log
+echo "Response RVA files archived on host"  >> $cnet_rva_rt_log
+
+# create archive directory on PDM
+ssh -xl $username $remote_svr mkdir -p -m 777 $remote_arch_dir
+echo "Result of mkdir archive command: " $? >> $cnet_rva_rt_log
+echo "Remote archive directory created $remote_arch_dir"  >> $cnet_rva_rt_log
+
+# move RVA files to archive directory on PDM
+ssh -xl $username $remote_svr mv $remote_tmp_dir/restore* $remote_arch_dir
+
+echo "RVA files archieved on PDM" >> $cnet_rva_rt_log
+
+# delete temporary directory on PDM
+ssh -xl $username $remote_svr rm -f $remote_tmp_dir/*.*
+
+echo "RVA temporary files deleted from $remote_tmp_dir" >> $cnet_rva_rt_log
+
+ssh -xl $username $remote_svr rmdir  $remote_tmp_dir
+
+echo "RVA temporary directory $remote_tmp_dir  deleted" >> $cnet_rva_rt_log
+
+# delete response files just processed from PDM cnet_rvback dir
+ssh -xl $username $remote_svr rm -f $remote_cnet_dir/restore*
+
+echo " deleting response files already processed from $remote_cnet_dir"
+
+echo "Response files already processed from PDM deleted" >> $cnet_rva_rt_log
+echo "From directory $remote_cnet_dir" >> $cnet_rva_rt_log
+
+# process calls into array when RVA file transfer process in active mode
+if [[ $MODE = a ]]
+then
+#  echo "preparing to process RVA  data files." >> $cnet_rva_rt_log
+#  echo "  After process data files are stored in:" >> $cnet_rva_rt_log
+#  echo "  $neutraldir files" >> $cnet_rva_rt_log
+
+  # create RVA file list
+  cd $wkqual
+  rva_rt_list=`ls restore*`
+  echo "RVA file list: $rva_rt_list" >> $cnet_rva_rt_log
+
+  # create RVA array of RVA file list
+  set -A rva_rt_array $rva_rt_list
+
+  # loop thru RVA files and load them into the database
+  let i=0
+  while (( $i < ${#rva_rt_array[*]} ))
+  do
+    echo "preparing to load ${rva_rt_array[i]}" >> $cnet_rva_rt_log
+    echo "from directory $wkqual" >> $cnet_rva_rt_log
+    echo "RVA file name date string check" >> $cnet_rva_rt_log
+    cnetdate=`echo ${rva_rt_array[i]} |cut -c 18-31`
+
+    echo "*** test file date: $cnetdate    "
+    echo "*** end test   "
+
+      # Check for empty RVA file
+      WORDCOUNT=`wc -w ${rva_rt_array[i]} |awk '{print $1}'`
+      echo "Checking file to see if is empty..." >> $cnet_rva_rt_log
+      
+
+      echo "wordcount: $WORDCOUNT"
+      if [ $WORDCOUNT -eq 0 ]
+      then
+        echo "RVA file is empty, nothing to load" >> $cnet_rva_rt_log
+        rm  ${rva_rt_array[i]}
+
+      else
+        #give me files only for RVA not singles
+        RVA_RT=`head -c -n 1 ${rva_rt_array[i]} |awk '{print $1}'`
+        if [ $RVA_RT = R ]
+        then 
+        echo "RVA file contains data ..." >> $cnet_rva_rt_log
+        echo "RVA file ${rva_rt_array[i]} loaded at `date +%m%d%y` `date +%T`" >> $cnet_rva_rt_log
+       echo "Starting to load RVA file ..." >> $cnet_rva_rt_log
+       nohup sqlldr userid=$user_password@$dbname \
+       control=$sqlqual/rva_response_load.ctl \
+       log=$finqual/${rva_rt_array[i]}.log \
+       bad=$finqual/${rva_rt_array[i]}.bad \
+       data=$wkqual/${rva_rt_array[i]}
+       stat=$?
+
+        # run database validations and insert RVA call data into the customer model
+       
+        echo " ready to run proc from $sqlqual**********"
+        sqlplus $user_password@$dbname @$sqlqual/rva_rt_outage_proc.sql 
+        echo " procedure run inside the loop from $sqlqual**********"
+        echo "rva outage procedure run to insert data into ces calls" >> $cnet_rva_rt_log
+
+        echo 'ORACLE stored procedure populated data model'
+
+        # To avoid losing any data files
+        # PROCESSED, DELETE FILE if rva_slg equals R 
+        rm  ${rva_rt_array[i]}  
+ 
+      fi
+      fi
+     echo "$i *********************"
+  let i=i+1
+          echo "$i again, $i + 1 *********************"
+  done
+else
+  echo "In STANDBY mode. Not loading RVA files to database, these files have been archived on the host." >> $cnet_rva_rt_log
+fi
+
+# clean up
+rm -f $cnet_rva_rt_log2
+
+#rm -f $wkqual/*.*.*
+rm -f nohup*
+#echo "removed files from $wkqual directory" >> $cnet_rva_rt_log
+#rmdir  $wkqual
+#echo "removed directory $wkqual" >> $cnet_rva_rt_log
+echo "********** Finished RVA file process on `date` **********" >> $cnet_rva_rt_log
+exit 0

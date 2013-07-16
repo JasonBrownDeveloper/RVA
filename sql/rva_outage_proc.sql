@@ -1,0 +1,6 @@
+BEGIN
+        PCK_SINGLES_CNET.PROC_SINGLES_CNET;
+        COMMIT;
+END;
+/
+exit;

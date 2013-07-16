@@ -1,0 +1,8 @@
+#!/usr/bin/ksh
+set -x
+
+cd $HOME
+. .profile
+
+sqlplus $sqlplus @sql/cnet_rva_clean_xml.sql
+sql/cnet_rva_load.sql
