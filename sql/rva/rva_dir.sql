@@ -1,0 +1,7 @@
+DROP DIRECTORY RVADIR;
+
+CREATE OR REPLACE DIRECTORY 
+RVADIR AS 
+'/home/user/works/rva';
+
+exit

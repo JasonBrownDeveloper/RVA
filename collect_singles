@@ -1,7 +1,0 @@
-#!/usr/bin/ksh
-set -x
-
-cd $HOME
-. .profile
-
-sqlplus $sqlplus @sql/cnet_singles_proc.sql

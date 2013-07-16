@@ -1,0 +1,303 @@
+#!/bin/ksh
+set -x
+
+cd $HOME
+. .profile
+
+LOGDIR=$HOME/reports/rva/rvafiles_`date +%Y%m`
+LOGFILE=$LOGDIR/rva_`date +%Y%m%d%H%M%S`.log
+ONCALLSQL=$HOME/sql/oncall.sql
+ONCALLOUT=$HOME/reports/oncall.spool
+ONCALLEMAIL=`sed '/^$/d' $ONCALLOUT | awk '{print $1}'`
+ONCALLPAGER=`sed '/^$/d' $ONCALLOUT | awk '{print $2}'`
+WORKDIR=$HOME/works/rva/rva_`date +%H%M%S`
+RVADIR=/neutralfile/cnet_rvout
+AP1=127.0.0.1
+AP2=127.0.0.2
+AP3=127.0.0.3
+AP4=127.0.0.4
+
+SCRIPT=$0
+
+function NotifyOncall {
+  ERROR="ERROR $SCRIPT $ERROR"
+  echo $ERROR >> $LOGFILE
+  cat $LOGFILE | mailx -s "$ERROR" $ONCALLEMAIL
+  echo $ERROR | mailx $ONCALLPAGER
+  return
+}
+
+mkdir $LOGDIR
+
+# Pick up on call person
+# Connect to database and run script to query oncall table and spool results.
+sqlplus -s $sqlplus @$ONCALLSQL $ONCALLOUT
+
+if [[ $? -ne 0 ]]
+then
+  ERROR="Could not pick up on-call person."
+  NotifyOncall
+  exit 1
+fi
+ONCALLEMAIL=`sed '/^$/d' $ONCALLOUT | awk '{print $1}'`
+ONCALLPAGER=`sed '/^$/d' $ONCALLOUT | awk '{print $2}'`
+echo "On-call Email: $ONCALLEMAIL" >> $LOGFILE
+echo "On-call Pager: $ONCALLPAGER" >> $LOGFILE
+
+# Check to see if right number of arguments were passed
+# Check to see if mode argument is one of two acceptable values.
+#   a = active
+#   s = standby
+if [[ ( $# -ne 1 ) ]]
+then
+  echo "Usage: $0 [host]" >> $LOGFILE
+  ERROR="Called with wrong number of arguments."
+  NotifyOncall
+  exit 1
+fi
+HOST=$1
+echo "Host: $HOST" >> $LOGFILE
+
+echo "***** STARTING on `date` *****" >> $LOGFILE
+
+# Determine what sites are avaliable
+set -A SITES `cmd sites | grep -e $AP1 -e $AP2 -e $AP3 -e $AP4 | awk '{print $1}'`
+if [[ ${#SITES[*]} -lt 1 ]]
+then
+  ERROR="could not find available app server"
+  NotifyOncall
+  exit 1
+fi
+
+echo $WORKDIR >> $LOGFILE
+mkdir $WORKDIR
+
+# Pull any RVA xml files from app servers
+CURRENT=0
+while [[ $CURRENT -lt ${#SITES[*]} ]]
+do
+  scp ${SITES[$CURRENT]}:$HTMLDIR/RVA_*.xml $WORKDIR
+  ssh ${SITES[$CURRENT]} "rm $HTMLDIR/RVA_*.xml"
+  CURRENT=$((CURRENT + 1))
+done
+
+# Create dynamic sql file
+FILELIST=`ls $WORKDIR/RVA_*.xml`
+echo $FILELIST >> $LOGFILE
+echo 'BEGIN' > $WORKDIR/rva_ondemand.sql
+for FILE in $FILELIST
+do
+  echo "INSERT INTO rva_xml VALUES (XMLType(BFILENAME('RVADIR', '`basename $FILE`'),NLS_CHARSET_ID('AL32UTF8')), NULL);" >> $WORKDIR/rva_ondemand.sql 
+  # The Oracle directory object can't be dynamic so move it to a static path
+  mv $FILE $WORKDIR/..
+done
+echo 'COMMIT;' >> $WORKDIR/rva_ondemand.sql
+echo 'END;' >> $WORKDIR/rva_ondemand.sql
+echo '/' >> $WORKDIR/rva_ondemand.sql
+echo 'exit' >> $WORKDIR/rva_ondemand.sql
+
+# Load rva xml files into database
+sqlplus $sqlplus @$WORKDIR/rva_ondemand.sql
+
+# Only remove files this run has processed
+for FILE in $FILELIST
+do
+  rm $WORKDIR/../`basename $FILE`
+done
+
+# Check to see if IT is ready for another batch
+FILEFLAG=`ssh $HOST "ls $RVADIR/request.verify | wc -l"`
+if [[ $FILEFLAG -eq 1 ]]
+then
+  LASTDATE=`cat $WORKDIR/../last.request`
+  CURRDATE=`date +%Y%m%d%H%M%S`
+  DIFF=`difftime $LASTDATE $CURRDATE`
+  echo "$CURRDATE - $LASTDATE = $DIFF seconds" >> $LOGFILE
+  let "MINUTES = DIFF / 60"
+  ERROR="IT has not picked up cellnet request file for $MINUTES minutes"
+  NotifyOncall
+  exit 1
+fi
+
+# Use PL/SQL and XPath to form rva requests
+sqlplus -s $sqlplus << EOF
+  set serveroutput on 100000
+
+  --Get static date time
+  COL datetime NEW_VALUE datetime
+  SELECT SYSDATE AS datetime FROM DUAL;
+
+  --Process RVA ondemand
+  DECLARE
+    eventidx INTEGER;
+    meterno VARCHAR2(20);
+    meterid NUMBER;
+    psr NUMBER;
+    restoretime DATE;
+    begintime DATE;
+    i INTEGER;
+    request CHAR(166);
+  
+    CURSOR xml_table IS
+      SELECT *
+        FROM rva_xml
+       WHERE processed = '&datetime';
+    
+  BEGIN
+    UPDATE rva_xml
+       SET processed = '&datetime'
+     WHERE processed IS NULL;
+       
+    FOR xml_rec IN xml_table
+    LOOP
+      IF xml_rec.xml.existsNode('/WIDGET_PRINT/WIDGET/CHILDREN/WIDGET[NAME=''tiCustInfoForm'']/CHILDREN/WIDGET[NAME=''tiCustRefNumText'']/VALUE') = 0 THEN
+        DBMS_OUTPUT.PUT_LINE('Error: Couldn''t find event_idx');
+      ELSE  
+        --extractValue is not supported in PL/SQL yet, have to use extract() + getNumberVal()
+        eventidx := xml_rec.xml.extract('/WIDGET_PRINT/WIDGET/CHILDREN/WIDGET[NAME=''tiCustInfoForm'']/CHILDREN/WIDGET[NAME=''tiCustRefNumText'']/VALUE/text()').getNumberVal();
+    
+        i := 1;
+        LOOP
+          EXIT WHEN xml_rec.xml.existsNode('/WIDGET_PRINT/WIDGET/CHILDREN/WIDGET[''tiCust_xrttable'']/CELL_VALUES/ROW['||i||']') = 0;
+    
+	  DECLARE
+	    no_meter_no EXCEPTION;
+	    no_event_idx EXCEPTION;
+          BEGIN
+            meterno := xml_rec.xml.extract('/WIDGET_PRINT/WIDGET/CHILDREN/WIDGET[''tiCust_xrttable'']/CELL_VALUES/ROW['||i||']/CELL[13]/VALUE/text()').getStringVal();
+  
+	    BEGIN
+              SELECT meter_id, meter_user_def_4
+                INTO meterid, psr
+                FROM cu_meters
+               WHERE meter_no = meterno;
+            EXCEPTION
+              WHEN no_data_found THEN
+		RAISE no_meter_no; --Dont create a request; exit from outer block
+            END;
+  
+	    IF psr >= 85 THEN
+  	      BEGIN
+                SELECT NVL(restore_time,SYSDATE), NVL(begin_time,SYSDATE)
+                  INTO restoretime, begintime
+                  FROM jobs
+                 WHERE event_idx = eventidx;
+              EXCEPTION
+                WHEN no_data_found THEN
+  		RAISE no_event_idx; --Dont create a request; exit from outer block
+              END;
+
+              request := substr(rpad(eventidx,25,' '),1,25)
+                      || 'IND'
+                      || 'M'
+                      || substr(rpad(meterno,20,' '),1,20)
+                      || substr(rpad(meterid,25,' '),1,25)
+                      || substr(rpad('R',25,' '),1,25) --util_extra_1
+                      || substr(rpad(to_char(begintime,'MM/DD/YY HH24:MI:SS'),25,' '),1,25) --util_extra_2
+                      || substr(rpad(' ',25,' '),1,25) --util_extra_3
+                      || to_char(restoretime,'MM/DD/YY HH24:MI:SS');
+
+              INSERT INTO rva_cnet VALUES (eventidx, meterid, request, NULL, NULL, NULL);
+            END IF;
+          EXCEPTION
+	    WHEN no_meter_no THEN
+              DBMS_OUTPUT.PUT_LINE('No rows returned for meterno: '||eventidx||' '||meterno);
+            WHEN no_event_idx THEN
+              DBMS_OUTPUT.PUT_LINE('No rows returned for eventidx: '||eventidx||' '||meterno);
+            WHEN others THEN
+              DBMS_OUTPUT.PUT_LINE('Others ' || SQLCODE || ' ' || SQLERRM ||': '||eventidx||' '||meterno);
+	  END;
+    
+          i := i + 1;
+        END LOOP;
+      END IF;
+    END LOOP;
+  END;
+  /
+
+  --Process RVA automated
+  DECLARE
+    cnt INTEGER;
+  BEGIN
+    SELECT COUNT(*) INTO cnt
+      FROM jobs
+     WHERE alarm_state IN ('NEW','UAS','ASN')
+       AND num_cust_out = 1
+       AND REGEXP_LIKE(trouble_code, '.*Out.*');
+  
+    IF cnt >= 10 THEN
+      INSERT INTO rva_cnet
+        SELECT distinct j.event_idx
+             , i.account_num
+             ,    substr(rpad(j.event_idx,25,' '),1,25)
+               || 'IND'
+               || 'M'
+               || substr(rpad(cm.meter_no,20,' '),1,20)
+               || substr(rpad(i.account_num,25,' '),1,25)
+               || substr(rpad('S',25,' '),1,25) --util_extra_1
+               || substr(rpad(NVL(substr(i.alternate_phone,4,7)||substr(i.alternate_phone,1,3),' '),25,' '),1,25) --util_extra_2
+               || i.language_flag --util_extra_3.1
+               || substr(rpad(i.complaint,24,' '),1,24) --util_extra_3.2
+               || to_char(NVL(j.begin_time,SYSDATE),'MM/DD/YY HH24:MI:SS')
+             , NULL
+             , NULL
+             , NULL
+          FROM jobs j
+             , (select event_idx
+                     , user_name
+                     , complaint
+                     , account_num
+                     , alternate_phone
+                     , language_flag
+                  from incidents i2
+                 where numb = (select max(numb)
+                                 from incidents
+                                where i2.event_idx = event_idx
+                                  and i2.account_num = account_num)) i
+             , cu_meters cm
+             , rva_cnet rc
+         WHERE j.event_idx = i.event_idx
+           AND i.account_num = cm.meter_id
+           AND j.event_idx = rc.event_idx(+)
+           AND rc.event_idx is NULL -- Haven't already sent a request for this event
+           AND j.alarm_state in ('NEW','UAS','ASN') -- Not already being worked
+           AND j.num_cust_out = 1 -- Singles only
+           AND i.user_name <> 'CNET' -- Not entered by the POA process
+           AND NOT REGEXP_LIKE(i.user_name, '[0-9]{4}') -- Not entered by a CSR
+           AND i.complaint LIKE '1%' -- Outs only
+           AND cm.meter_user_def_4 >= 85; -- Only reliable meters
+    END IF;
+  END;
+  /
+
+  --Spool CellNet request file no more than 2k
+  UPDATE rva_cnet
+     SET transmitted = '&datetime'
+   WHERE transmitted IS NULL
+     AND ROWNUM <= 2000;
+
+  spool $WORKDIR/rva_cnet.1
+  set head off linesize 166 pagesize 0 feedback off
+  SELECT message_tx
+    FROM rva_cnet
+   WHERE transmitted = '&datetime';
+  spool off
+
+  exit
+EOF
+
+sed -e '/^new/d' -e '/^old/d' $WORKDIR/rva_cnet.1 > $WORKDIR/rva_cnet.2
+cat $WORKDIR/rva_cnet.2 >> $LOGFILE
+if [[ `wc $WORKDIR/rva_cnet.2 | awk '{print $1}'` -gt 0 ]]
+then
+  scp $WORKDIR/rva_cnet.2 $HOST:$RVADIR
+  ssh $HOST "mv $RVADIR/rva_cnet.2 $RVADIR/request.verify"
+fi
+date +%Y%m%d%H%M%S > $WORKDIR/../last.request
+
+rm -rf $WORKDIR
+
+echo "***** FINISHED on `date` *****" >> $LOGFILE
+
+exit 0
+
