@@ -240,7 +240,7 @@ sqlplus -s $sqlplus << EOF
          $SOURCE
          AND j.num_cust_out = 1 -- Singles only
          AND i.complaint LIKE '1%' -- Outs only
-         AND (cm.meter_user_def_4 >= 85 OR cm.meter_user_def_5 = 'G'); -- Only reliable meters
+	   ;
   END;
   /
 
