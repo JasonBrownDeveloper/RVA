@@ -240,6 +240,8 @@ sqlplus -s $sqlplus << EOF
          AND j.event_idx = rc.event_idx(+)
          AND j.event_idx = cd.dispatched_at_idx(+)
          AND j.event_idx = ca.assignment_idx(+)
+         AND ((cm.meter_user_def_4 is not null AND cm.meter_user_def_4 > 0) OR cm.meter_user_def_5 is not null) -- Smart Meter
+         AND substr(cm.meter_no,2,1) in ('1','2','3') -- Single Phase meters only
          AND (rc.max_transmitted is NULL -- Haven't already sent a request for this event
            OR rc.max_transmitted <= SYSDATE - 1/24) -- Or enough time has elapsed
          AND j.alarm_state not in ('CNL','CMP','C-CNL','RST','INC') -- Not already complete
