@@ -46,7 +46,7 @@ echo "On-call Pager: $ONCALLPAGER" >> $LOGFILE
 echo "***** STARTING on `date` *****" >> $LOGFILE
 
 # Determine what sites are avaliable
-set -A SITES `cmd sites | grep -e $AP1 -e $AP2 -e $AP3 -e $AP4 | awk '{print $1}'`
+set -A SITES `~/isis/bin/cmd sites | grep -e $AP1 -e $AP2 -e $AP3 -e $AP4 | awk '{print $1}'`
 if [[ ${#SITES[*]} -lt 1 ]]
 then
   ERROR="could not find available app server"
@@ -203,7 +203,7 @@ sqlplus -s $sqlplus << EOF
   BEGIN
     INSERT INTO rva_cnet
       SELECT DISTINCT
- 	       j.event_idx
+             j.event_idx
            , i.account_num
            ,    substr(rpad(j.event_idx,25,' '),1,25)
              || 'IND'
@@ -231,16 +231,22 @@ sqlplus -s $sqlplus << EOF
                                 and i2.account_num = account_num)) i
            , cu_meters cm
            , rva_cnet rc
+           , crew_dispatches cd
+           , crew_assignments ca
        WHERE j.event_idx = i.event_idx
          AND i.account_num = cm.meter_id
          AND j.event_idx = rc.event_idx(+)
- 	   AND (rc.transmitted is NULL -- Haven't already sent a request for this event
- 	    OR rc.transmitted <= SYSDATE - 1/24) -- Or enough time has elapsed 
-         AND j.alarm_state in ('NEW','UAS','ASN') -- Not already being worked
+         AND j.event_idx = cd.dispatched_at_idx(+)
+         AND j.event_idx = ca.assignment_idx(+)
+         AND (rc.transmitted is NULL -- Haven't already sent a request for this event
+           OR rc.transmitted <= SYSDATE - 1/24) -- Or enough time has elapsed
+         AND j.alarm_state not in ('CNL','CMP','C-CNL','RST','INC') -- Not already complete
+         AND cd.dispatched_at_idx is null -- Not already worked
+         AND ca.assignment_idx is null -- Not already worked
          $SOURCE
          AND j.num_cust_out = 1 -- Singles only
          AND i.complaint LIKE '1%' -- Outs only
-	   ;
+           ;
   END;
   /
 
