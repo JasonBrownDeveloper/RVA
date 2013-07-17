@@ -87,8 +87,7 @@ sqlplus $sqlplus @$WORKDIR/rva_ondemand.sql
 
 for FILE in $FILELIST
 do
-  #TESTING rm $WORKDIR/../`basename $FILE`
-  touch $WORKDIR/../`basename $FILE`
+  rm $WORKDIR/../`basename $FILE`
 done
 
 # Use PL/SQL and XPath to form rva requests
@@ -224,7 +223,7 @@ sqlplus -s $sqlplus << EOF
          AND i.account_num = cm.meter_id
          AND j.event_idx = rc.event_idx(+)
  	   AND (rc.transmitted is NULL -- Haven't already sent a request for this event
- 	    OR rc.transmitted <= SYSDATE - 6/24) -- Or enough time has elapsed 
+ 	    OR rc.transmitted <= SYSDATE - 1/24) -- Or enough time has elapsed 
          AND j.alarm_state in ('NEW','UAS','ASN') -- Not already being worked
          AND j.num_cust_out = 1 -- Singles only
          AND i.user_name <> 'CNET' -- Not entered by the POA process
@@ -636,8 +635,8 @@ sqlplus -s $sqlplus << EOF >> $LOGFILE
       END IF;
     END LOOP;
 
-    --TESTING DELETE FROM rva_work
-     --WHERE processed = TO_DATE('&datetime','DD-MON-YYYY HH24:MI:SS');
+    DELETE FROM rva_work
+     WHERE processed = TO_DATE('&datetime','DD-MON-YYYY HH24:MI:SS');
   END;
   /
 
@@ -670,7 +669,7 @@ then
   fi
 fi
 
-#TESTING rm -rf $WORKDIR
+rm -rf $WORKDIR
 
 echo "***** FINISHED on `date` *****" >> $LOGFILE
 
