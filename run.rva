@@ -11,7 +11,6 @@ ONCALLOUT=$HOME/reports/oncall.spool
 ONCALLEMAIL=`sed '/^$/d' $ONCALLOUT | awk '{print $1}'`
 ONCALLPAGER=`sed '/^$/d' $ONCALLOUT | awk '{print $2}'`
 WORKDIR=$HOME/works/rva/rva_`date +%H%M%S`
-STARTTIME=`date +%Y-%m-%dT%H:%M:%S`
 AP1=127.0.0.1
 AP2=127.0.0.2
 AP3=127.0.0.3
@@ -89,6 +88,19 @@ for FILE in $FILELIST
 do
   rm $WORKDIR/../`basename $FILE`
 done
+
+CLEANUPDATE=`cat $HOME/works/rva/cleanup.date`
+CURRENTDATE=`date +%Y%m%d%H%M%S`
+DIFF=`difftime $CLEANUPDATE $CURRENTDATE`
+
+# Reset every 8 hours or 1 shift
+if [[ $DIFF -gt 28800 ]];
+then
+  SOURCE="AND i.user_name <> 'CNET' -- Not entered by the POA process
+         AND NOT REGEXP_LIKE(i.user_name, '[0-9]{4}') -- Not entered by a CSR"
+else
+  SOURCE=""
+fi
 
 # Use PL/SQL and XPath to form rva requests
 sqlplus -s $sqlplus << EOF
@@ -225,9 +237,8 @@ sqlplus -s $sqlplus << EOF
  	   AND (rc.transmitted is NULL -- Haven't already sent a request for this event
  	    OR rc.transmitted <= SYSDATE - 1/24) -- Or enough time has elapsed 
          AND j.alarm_state in ('NEW','UAS','ASN') -- Not already being worked
+         $SOURCE
          AND j.num_cust_out = 1 -- Singles only
-         AND i.user_name <> 'CNET' -- Not entered by the POA process
-         AND NOT REGEXP_LIKE(i.user_name, '[0-9]{4}') -- Not entered by a CSR
          AND i.complaint LIKE '1%' -- Outs only
          AND (cm.meter_user_def_4 >= 85 OR cm.meter_user_def_5 = 'G'); -- Only reliable meters
   END;
